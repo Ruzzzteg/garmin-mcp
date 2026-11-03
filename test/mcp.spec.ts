@@ -1,19 +1,43 @@
 import { Encoder, Profile } from "@garmin/fitsdk";
-import { exports } from "cloudflare:workers";
+import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import { zipSync } from "fflate";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import worker from "../src";
+import { handleAuthorize } from "../src/auth/authorize";
 import { mockGarmin } from "./helpers";
 
 const BASE = "https://garmin-mcp.example.com";
 const REDIRECT = "https://client.example.com/callback";
-const PASSWORD = "test-owner-password";
 
-const call = (path: string, init?: RequestInit) => exports.default.fetch(new Request(`${BASE}${path}`, init));
+/**
+ * An execution context as Cloudflare passes it once Access has signed the
+ * owner in (`access.dev` in wrangler.jsonc only applies to `wrangler dev`).
+ */
+function contextWithAccess(ctx: ExecutionContext): ExecutionContext {
+  const access = { aud: env.ACCESS_AUD, getIdentity: async () => ({ email: "owner@example.com" }) };
+  return new Proxy(ctx, {
+    get(target, property) {
+      if (property === "access") return access;
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+async function call(path: string, init?: RequestInit): Promise<Response> {
+  const ctx = createExecutionContext();
+  // Requests reaching a Worker carry incoming `cf` properties; these tests don't need any.
+  const request = new Request(`${BASE}${path}`, init) as Request<unknown, IncomingRequestCfProperties>;
+  const response = await worker.fetch(request, env, contextWithAccess(ctx));
+  await waitOnExecutionContext(ctx);
+  return response;
+}
 const b64url = (bytes: ArrayBuffer | Uint8Array) =>
   btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
 /** Run the whole OAuth flow (DCR, consent, PKCE token exchange) and return an access token. */
-async function authorize(password = PASSWORD): Promise<string | Response> {
+async function authorize(): Promise<string | Response> {
   const client = await (
     await call("/register", {
       method: "POST",
@@ -44,7 +68,7 @@ async function authorize(password = PASSWORD): Promise<string | Response> {
     method: "POST",
     redirect: "manual",
     headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ handle, decision: "approve", password }),
+    body: new URLSearchParams({ handle, decision: "approve" }),
   });
   if (approval.status !== 302) return approval;
 
@@ -95,10 +119,14 @@ describe("OAuth", () => {
     expect(response.headers.get("www-authenticate")).toContain("resource_metadata=");
   });
 
-  it("refuses the wrong owner password", async () => {
-    const result = await authorize("not-the-password");
-    expect(result).toBeInstanceOf(Response);
-    expect((result as Response).status).toBe(401);
+  it("serves the consent page only to requests that passed this Access application", async () => {
+    const request = new Request(`${BASE}/authorize?client_id=x`);
+    const withAccess = (aud: string) =>
+      ({ access: { aud, getIdentity: async () => ({ email: "owner@example.com" }) } }) as unknown as ExecutionContext;
+
+    expect((await handleAuthorize(request, env, {} as ExecutionContext)).status).toBe(403);
+    expect((await handleAuthorize(request, env, withAccess("another-app"))).status).toBe(403);
+    expect((await handleAuthorize(request, { ...env, ACCESS_AUD: "" }, withAccess(""))).status).toBe(403);
   });
 });
 

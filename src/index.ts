@@ -2,7 +2,8 @@
  * Garmin Connect MCP server on Cloudflare Workers.
  *
  * - /mcp        Streamable HTTP MCP endpoint, protected by OAuth 2.1.
- * - /authorize  Consent page where the owner approves an MCP client.
+ * - /authorize  Consent page where the owner approves an MCP client, behind
+ *               Cloudflare Access.
  * - OAuth metadata, token, registration and revocation endpoints are served by
  *   OAuthProvider.
  */
@@ -26,9 +27,9 @@ const apiHandler = {
 };
 
 const defaultHandler = {
-  async fetch(request: Request, env: Env) {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const url = new URL(request.url);
-    if (url.pathname === "/authorize") return handleAuthorize(request, env);
+    if (url.pathname === "/authorize") return handleAuthorize(request, env, ctx);
     if (url.pathname === "/" && request.method === "GET") {
       return Response.json({
         name: SERVER_INFO.title,

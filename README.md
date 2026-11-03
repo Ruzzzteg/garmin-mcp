@@ -23,7 +23,7 @@ Everyone deploys it to their own Cloudflare account with their own Garmin key: i
 ## How it works
 
 ```
-MCP client  ──OAuth 2.1──▶ garmin-mcp Worker ─┬─ /authorize       consent page (owner password)
+MCP client  ──OAuth 2.1──▶ garmin-mcp Worker ─┬─ /authorize       consent page, behind Cloudflare Access
 (Claude, Cursor…)                              ├─ /token, /register, /.well-known/*   OAuth server (OAuthProvider)
                                                └─ /mcp            MCP server (Streamable HTTP, stateless)
                                                                    └─▶ personal.connectapi.garmin.com
@@ -31,7 +31,7 @@ MCP client  ──OAuth 2.1──▶ garmin-mcp Worker ─┬─ /authorize     
 
 1. **The client connects to `/mcp`.** Without a token it gets a `401` pointing to the OAuth metadata (`/.well-known/oauth-protected-resource/mcp`).
 2. **The client registers itself**, through dynamic client registration (`/register`) or a Client ID Metadata Document, and opens `/authorize` in the browser.
-3. **You approve on the consent page.** It shows which application is asking and where the token will be sent. You enter `OWNER_PASSWORD` and click *Allow*. The server has exactly one user: you.
+3. **You sign in and approve.** [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/access-controls/) protects `/authorize`: it asks for a one-time code sent to your email before the page loads, and only your address is allowed. The consent page then shows which application is asking and where the token will be sent, and you click *Allow*. The server has exactly one user: you.
 4. **The client gets its tokens:** a 1-hour access token and a refresh token. The refresh token lasts as long as you use the client at least once a month, for up to a year.
 5. **The server calls Garmin.** On each tool call it exchanges your Personal API key for a 24-hour Garmin token, caches it in memory and in KV, and calls the API.
 
@@ -102,7 +102,7 @@ Prompts (shortcuts that clients show as commands):
 src/
   index.ts              Entry point: OAuthProvider protects /mcp and serves /authorize
   env.d.ts              Types for the bindings OAuthProvider adds at runtime
-  auth/authorize.ts     Consent page: owner password and attempt limit
+  auth/authorize.ts     Consent page, served only to requests that passed Cloudflare Access
   garmin/
     client.ts           Personal API client: key exchange, token cache, errors
     dates.ts            Dates: "today" per time zone, range windows
@@ -129,7 +129,7 @@ They live in `.env` locally and as Worker secrets in production. They never go t
 | Name | What it is | Where to get it |
 |---|---|---|
 | `GARMIN_API_KEY` | The Personal API key of your Garmin Connect account. The server exchanges it for 24-hour tokens. | In [Garmin Connect → Personal API](https://connect.garmin.com/app/settings/personalApiToken), signed in on the web: *Create Key*, accept the terms and pick an expiry (30, 90, 180 days or 1 year). It is shown **only once**. Only one key can be active: creating another requires deleting the current one. |
-| `OWNER_PASSWORD` | The consent page password. It stops anyone else from connecting a client to your server. | Make up a long random one: `openssl rand -base64 32`. Keep it in your password manager: you'll need it every time you connect a new client. |
+| `ACCESS_AUD` | Audience (AUD) tag of the Cloudflare Access application that protects `/authorize`. The Worker only serves the consent page to requests Access authenticated for this application, so nothing else can approve clients. It is not secret, but it is specific to your account. | Zero Trust → Access → Applications → your application → *Overview* (see [Cloudflare Access](#cloudflare-access)). Locally, keep `local-dev`. |
 
 ### Variables
 
@@ -145,7 +145,20 @@ Set in `wrangler.jsonc`, under `vars`. They are not secret.
 | Binding | Type | Purpose |
 |---|---|---|
 | `OAUTH_KV` | KV namespace (`garmin-mcp-oauth-kv`) | OAuth state: registered clients, granted consents and tokens (stored only as hashes, with their data encrypted). It also caches the Garmin token so every Worker instance shares it. |
-| `LOGIN_LIMITER` | Rate limiting | At most 5 password attempts per minute and IP on the consent page. |
+
+### Cloudflare Access
+
+`/authorize` is protected by a self-hosted Access application, so only you can approve clients. It has no password to leak or brute-force: Access signs you in with a one-time code sent to your email.
+
+1. In the Cloudflare dashboard, open **Zero Trust**. The first time, it asks you to pick a team name.
+2. Go to **Access → Applications → Add an application → Self-hosted**:
+   - **Domain:** `garmin-mcp.<your-subdomain>.workers.dev`, path `authorize`. Only that path is protected; `/mcp`, `/token`, `/register` and the metadata must stay reachable for MCP clients.
+   - **Login method:** *One-time PIN*, the only one enabled, with *instant auth* so you skip the provider screen.
+   - **Policy:** *Allow*, include *Emails* → your email address.
+   - **Session duration:** 24 hours is a good default.
+3. Copy the application's **Application Audience (AUD) tag** and store it as `ACCESS_AUD`.
+
+`wrangler dev` simulates Access with the `access.dev` block in `wrangler.jsonc`, so locally `ACCESS_AUD=local-dev` and no sign-in is needed.
 
 ### Environment files
 
@@ -166,7 +179,7 @@ pnpm install
 cp .env.example .env
 ```
 
-Fill in `GARMIN_API_KEY` and `OWNER_PASSWORD` in `.env` and start the server. It runs at `http://localhost:8787/mcp`:
+Fill in `GARMIN_API_KEY` in `.env` (`ACCESS_AUD` stays `local-dev`) and start the server. It runs at `http://localhost:8787/mcp`:
 
 ```bash
 pnpm dev
@@ -186,7 +199,7 @@ To try it by hand you have two options:
   claude mcp add --transport http garmin-local http://localhost:8787/mcp
   ```
 
-Locally, KV and the rate limiter are simulated and stored in `.wrangler/state`.
+Locally, KV is simulated and stored in `.wrangler/state`, and Access is simulated by `access.dev` in `wrangler.jsonc`.
 
 Scripts:
 
@@ -204,7 +217,7 @@ Scripts:
 
 - **Tests (`test/`)** run inside the Workers runtime with `@cloudflare/vitest-plugin`, mocking Garmin's responses. They cover:
   - the Garmin client: key exchange, token cache, retry on 401 and errors;
-  - the full OAuth flow;
+  - the full OAuth flow, and that the consent page refuses requests without this Access application's identity;
   - range splitting and search filters;
   - compact views, aggregations and the kilogram conversion;
   - a real FIT file generated with the SDK's encoder.
@@ -225,7 +238,8 @@ Scripts:
 | MCP URL | `https://garmin-mcp.<your-subdomain>.workers.dev/mcp` (the `workers.dev` subdomain of your account) |
 | Root (`/`) | JSON with the name, version and MCP URL, handy as a health check |
 | KV | `garmin-mcp-oauth-kv`, created by the first deploy and reused by later ones |
-| Secrets | `GARMIN_API_KEY`, `OWNER_PASSWORD` (type `secret_text`) |
+| Secrets | `GARMIN_API_KEY`, `ACCESS_AUD` (type `secret_text`) |
+| Access | A self-hosted Access application on `/authorize` that only allows your email |
 | Observability | Workers logs on (dashboard → Workers & Pages → garmin-mcp → Logs) |
 | Preview URLs | Off: the production origin is the only OAuth issuer |
 | How it's deployed | By hand from your machine with `pnpm run deploy`. CI only checks. |
@@ -238,13 +252,14 @@ Scripts:
    pnpm wrangler login
    ```
 
-2. Fill in `.env` with both secrets and deploy, uploading them at the same time:
+2. Create the [Cloudflare Access](#cloudflare-access) application for `/authorize` and put its AUD tag in `.env` as `ACCESS_AUD`, next to `GARMIN_API_KEY`. If you don't know your `workers.dev` subdomain yet, deploy first: until `ACCESS_AUD` matches, `/authorize` answers 403.
+3. Deploy, uploading both secrets at the same time:
 
    ```bash
    pnpm wrangler deploy --secrets-file .env
    ```
 
-3. Wrangler prints the Worker URL: add `/mcp` and [connect a client](#connecting-a-client).
+4. Wrangler prints the Worker URL: add `/mcp` and [connect a client](#connecting-a-client).
 
 ### Deploying changes
 
@@ -266,7 +281,7 @@ pnpm check && pnpm run deploy
   Then authenticate it from `/mcp`.
 - **Other clients (Cursor, VS Code…):** any MCP client with OAuth and Streamable HTTP transport. Add it with the same URL.
 
-The client opens the consent page: check the name and destination it shows, enter `OWNER_PASSWORD` and click *Allow*.
+The client opens `/authorize` in your browser: sign in with the code Access emails you, check the application name and destination on the consent page, and click *Allow*.
 
 ## Operations
 
@@ -276,11 +291,7 @@ The client opens the consent page: check the name and destination it shows, ente
   pnpm wrangler secret put GARMIN_API_KEY
   ```
 
-- **Change the consent password.** Clients already connected keep working until their tokens expire.
-
-  ```bash
-  pnpm wrangler secret put OWNER_PASSWORD
-  ```
+- **Change who can approve clients:** edit the policy of the Access application (Zero Trust → Access → Applications). Clients already connected keep working until their tokens expire.
 
 - **Live logs:**
 
@@ -296,7 +307,7 @@ The client opens the consent page: check the name and destination it shows, ente
 - **Consent page:**
   - It shows the application's name, whether it is verified and the host the token will be sent to, and warns when the destination is a local app.
   - The form carries a single-use handle bound to the browser and cannot be embedded in another site.
-  - The password is compared in constant time, with a limit of 5 attempts per minute and IP.
+  - Only you reach it: Cloudflare Access signs you in with a one-time code to your email, and the Worker fails closed (403) unless the request carries this Access application's identity (`ctx.access`), so it can't be bypassed through another route.
 - **Secrets:** the Garmin key only lives in the Worker's secrets. MCP clients never see it, and it never appears in logs or responses.
 - **Read-only:** the Personal API cannot write, and the server only sends `GET` requests.
 - **Personal use:** the Personal API is for the key's owner. This server is meant for a single user and should not be shared with others.
@@ -316,6 +327,7 @@ The client opens the consent page: check the name and destination it shows, ente
   pnpm wrangler login --device --scopes account:read user:read workers:write workers_kv:write workers_scripts:write workers_tail:read
   ```
 
+- **`/authorize` answers 403 "Access required":** the request didn't come through the Access application, or `ACCESS_AUD` doesn't match its AUD tag. Check the application's domain and path and the secret.
 - **Tools answer "Garmin rejected the Personal API key":** the key expired or was deleted. Create another and update `GARMIN_API_KEY`.
 - **A client can't connect or asks to authorize again:** its refresh token expired (over a month without use) or the KV was cleared. Authorize it again from the client.
 - **Two `wrangler dev` at once fail with `SQLITE_BUSY`:** they share `.wrangler/state`. Start the second one with its own state:

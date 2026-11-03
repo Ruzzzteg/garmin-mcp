@@ -6,7 +6,7 @@ export default defineConfig({
     cloudflareTest({
       wrangler: { configPath: "./wrangler.jsonc" },
       miniflare: {
-        bindings: { GARMIN_API_KEY: "test-api-key", OWNER_PASSWORD: "test-owner-password" },
+        bindings: { GARMIN_API_KEY: "test-api-key", ACCESS_AUD: "local-dev" },
       },
     }),
   ],

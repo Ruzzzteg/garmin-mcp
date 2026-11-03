@@ -15,20 +15,20 @@
   // Without an id, the first `wrangler deploy` provisions the namespace
   // ("garmin-mcp-oauth-kv") and later deploys keep using it.
   "kv_namespaces": [{ "binding": "OAUTH_KV" }],
-  "ratelimits": [
-    {
-      "name": "LOGIN_LIMITER",
-      "namespace_id": "1001",
-      "simple": { "limit": 5, "period": 60 }
-    }
-  ],
   "vars": {
     // "global" (connect.garmin.com) or "cn" (connect.garmin.cn)
     "GARMIN_REGION": "global",
     // IANA time zone used to resolve "today" when a date is omitted
     "TIMEZONE": "Europe/Madrid"
   },
+  // ACCESS_AUD: audience tag of the Cloudflare Access application that
+  // protects /authorize.
   "secrets": {
-    "required": ["GARMIN_API_KEY", "OWNER_PASSWORD"]
+    "required": ["GARMIN_API_KEY", "ACCESS_AUD"]
+  },
+  // `wrangler dev` simulates Access with this identity; set ACCESS_AUD to the
+  // same aud in .env.
+  "access": {
+    "dev": { "aud": "local-dev", "identity": { "email": "owner@example.com" } }
   }
 }

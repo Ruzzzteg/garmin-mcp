@@ -14,8 +14,8 @@ export async function handleAuthorize(request: Request, env: Env): Promise<Respo
     return request.method === "POST" ? await submit(request, env) : await show(request, env);
   } catch (error) {
     if (error instanceof AuthorizationError && error.redirectTo) return Response.redirect(error.redirectTo, 302);
-    if (error instanceof AuthorizationError) return page("No se puede autorizar", escape(error.description), 400);
-    if (error instanceof CimdFetchError) return page("No se puede autorizar", "No se ha podido verificar la aplicación.", 400);
+    if (error instanceof AuthorizationError) return page("Cannot authorize", escape(error.description), 400);
+    if (error instanceof CimdFetchError) return page("Cannot authorize", "The application could not be verified.", 400);
     throw error;
   }
 }
@@ -41,13 +41,13 @@ async function submit(request: Request, env: Env): Promise<Response> {
 
   const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
   const { success } = await env.LOGIN_LIMITER.limit({ key: ip });
-  if (!success) return page("Demasiados intentos", "Espera un minuto y vuelve a intentarlo.", 429);
+  if (!success) return page("Too many attempts", "Wait a minute and try again.", 429);
 
   if (!(await isOwnerPassword(String(form.get("password") ?? ""), env.OWNER_PASSWORD))) {
     // The handle is still unused, so going back to the form works.
     return page(
-      "Contraseña incorrecta",
-      '<a href="javascript:history.back()">Vuelve atrás</a> e inténtalo de nuevo.',
+      "Wrong password",
+      '<a href="javascript:history.back()">Go back</a> and try again.',
       401,
     );
   }
@@ -77,25 +77,25 @@ async function isOwnerPassword(candidate: string, expected: string | undefined):
 function consentPage(details: ConsentDescription, handle: string): string {
   const name = escape(details.clientName);
   const origin = details.clientDomain
-    ? `Publicada por <strong>${escape(details.clientDomain)}</strong>.`
-    : "La aplicación se ha registrado sola; su nombre no está verificado.";
+    ? `Published by <strong>${escape(details.clientDomain)}</strong>.`
+    : "This application registered itself; its name is not verified.";
   const loopback = details.redirectIsLoopback
-    ? "<p class=warn>El acceso se enviará a una aplicación de este ordenador. Continúa solo si acabas de iniciar la conexión desde ella.</p>"
+    ? "<p class=warn>Access will be sent to an application on this computer. Continue only if you just started connecting from it.</p>"
     : "";
   return html(
-    `Autorizar ${name}`,
-    `<h1>¿Dar acceso a ${name}?</h1>
-<p>${origin} El acceso se enviará a <strong>${escape(details.redirectHost)}</strong>.</p>
+    `Authorize ${name}`,
+    `<h1>Give ${name} access?</h1>
+<p>${origin} Access will be sent to <strong>${escape(details.redirectHost)}</strong>.</p>
 ${loopback}
-<p>Podrá <strong>leer</strong> tus datos de Garmin Connect (actividades, sueño, salud). No puede modificar nada.</p>
+<p>It will be able to <strong>read</strong> your Garmin Connect data (activities, sleep, health). It cannot change anything.</p>
 <form method="post">
   <input type="hidden" name="handle" value="${escape(handle)}">
-  <label>Contraseña del propietario
+  <label>Owner password
     <input type="password" name="password" autocomplete="current-password" required autofocus>
   </label>
   <div class=actions>
-    <button name="decision" value="approve">Permitir</button>
-    <button name="decision" value="deny" formnovalidate class=secondary>Denegar</button>
+    <button name="decision" value="approve">Allow</button>
+    <button name="decision" value="deny" formnovalidate class=secondary>Deny</button>
   </div>
 </form>`,
   );
@@ -114,7 +114,7 @@ function page(title: string, body: string, status: number): Response {
 
 function html(title: string, body: string): string {
   return `<!doctype html>
-<html lang="es">
+<html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${title}</title>

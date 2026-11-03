@@ -1,161 +1,162 @@
 # garmin-mcp
 
-Servidor MCP remoto que da acceso, en solo lectura, a tus datos de Garmin Connect desde Claude (web, escritorio, móvil y Claude Code) o cualquier cliente MCP. Usa la [Personal API oficial de Garmin](https://developer.garmin.com/gc-developer-program/personal/personal-api): no necesita tu contraseña de Garmin ni hace scraping. Corre en Cloudflare Workers con el [Agents SDK](https://developers.cloudflare.com/agents/) y está protegido con OAuth 2.1.
+A remote MCP server that gives Claude (web, desktop, mobile and Claude Code), or any MCP client, read-only access to your Garmin Connect data. It uses Garmin's [official Personal API](https://developer.garmin.com/gc-developer-program/personal/personal-api): no Garmin password, no scraping. It runs on Cloudflare Workers with the [Agents SDK](https://developers.cloudflare.com/agents/) and is protected by OAuth 2.1.
 
-Cada persona lo despliega en su propia cuenta de Cloudflare con su propia key de Garmin: es un servidor para un único usuario (ver [Despliegue](#despliegue)).
+Everyone deploys it to their own Cloudflare account with their own Garmin key: it is a single-user server (see [Deployment](#deployment)).
 
-## Índice
+## Contents
 
-- [Cómo funciona](#cómo-funciona)
-- [Tools y prompts](#tools-y-prompts)
-- [Estructura del repositorio](#estructura-del-repositorio)
-- [Configuración](#configuración)
-- [Desarrollo local](#desarrollo-local)
-- [Tests, CI y evals](#tests-ci-y-evals)
-- [Despliegue](#despliegue)
-- [Conectar un cliente](#conectar-un-cliente)
-- [Operación](#operación)
-- [Seguridad](#seguridad)
-- [Límites](#límites)
-- [Solución de problemas](#solución-de-problemas)
+- [How it works](#how-it-works)
+- [Tools and prompts](#tools-and-prompts)
+- [Repository layout](#repository-layout)
+- [Configuration](#configuration)
+- [Local development](#local-development)
+- [Tests, CI and evals](#tests-ci-and-evals)
+- [Deployment](#deployment)
+- [Connecting a client](#connecting-a-client)
+- [Operations](#operations)
+- [Security](#security)
+- [Limits](#limits)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
 
-## Cómo funciona
+## How it works
 
 ```
-Cliente MCP ──OAuth 2.1──▶ Worker garmin-mcp ─┬─ /authorize       página de consentimiento (contraseña del propietario)
-(Claude, Cursor…)                              ├─ /token, /register, /.well-known/*   servidor OAuth (OAuthProvider)
-                                               └─ /mcp            servidor MCP (Streamable HTTP, sin estado)
+MCP client  ──OAuth 2.1──▶ garmin-mcp Worker ─┬─ /authorize       consent page (owner password)
+(Claude, Cursor…)                              ├─ /token, /register, /.well-known/*   OAuth server (OAuthProvider)
+                                               └─ /mcp            MCP server (Streamable HTTP, stateless)
                                                                    └─▶ personal.connectapi.garmin.com
 ```
 
-1. **El cliente se conecta a `/mcp`.** Sin token recibe un `401` que apunta a la metadata OAuth (`/.well-known/oauth-protected-resource/mcp`).
-2. **El cliente se registra solo.** Lo hace por registro dinámico (`/register`) o con un Client ID Metadata Document, y abre `/authorize` en el navegador.
-3. **Apruebas en la página de consentimiento.** Muestra qué aplicación pide acceso y adónde se enviará el token. Tú introduces `OWNER_PASSWORD` y pulsas *Permitir*. El servidor tiene un único usuario: tú.
-4. **El cliente obtiene sus tokens.** Recibe un token de acceso de 1 hora y un token de refresco. El de refresco dura mientras uses el cliente al menos una vez al mes, con un máximo de un año.
-5. **El servidor llama a Garmin.** En cada llamada a una tool canjea tu Personal API key por un token de Garmin de 24 h, lo cachea en memoria y en KV y llama a la API.
+1. **The client connects to `/mcp`.** Without a token it gets a `401` pointing to the OAuth metadata (`/.well-known/oauth-protected-resource/mcp`).
+2. **The client registers itself**, through dynamic client registration (`/register`) or a Client ID Metadata Document, and opens `/authorize` in the browser.
+3. **You approve on the consent page.** It shows which application is asking and where the token will be sent. You enter `OWNER_PASSWORD` and click *Allow*. The server has exactly one user: you.
+4. **The client gets its tokens:** a 1-hour access token and a refresh token. The refresh token lasts as long as you use the client at least once a month, for up to a year.
+5. **The server calls Garmin.** On each tool call it exchanges your Personal API key for a 24-hour Garmin token, caches it in memory and in KV, and calls the API.
 
-La key de Garmin nunca sale del Worker: los clientes MCP solo reciben tokens OAuth emitidos por este servidor.
+The Garmin key never leaves the Worker: MCP clients only receive OAuth tokens issued by this server.
 
-Además de reenviar las llamadas a la API, el servidor adapta las respuestas para que las lea bien un modelo:
+On top of forwarding API calls, the server shapes the responses so a model reads them well:
 
-- **Rangos largos:** parte los rangos de fechas en las ventanas que admite cada endpoint (28 días para pasos y estrés, 31 para sueño o Body Battery, 1 año para los resúmenes diarios) y une los resultados.
-- **Vistas compactas:** la búsqueda de actividades y los históricos de días y sueño devuelven por defecto una fila con las métricas clave; `detail=full` devuelve la respuesta completa de Garmin.
-- **Agregación:**
-  - Los históricos de días, sueño y pesajes calculan medias por semana o mes (`period`).
-  - La búsqueda de actividades da totales por periodo y deporte (`groupBy`). Une los subtipos: calle, trail y cinta cuentan como correr.
-- **Salida limpia:**
-  - Quita los `null` y el ruido social.
-  - Convierte los timestamps epoch a ISO 8601 y redondea los decimales.
-  - Deja fuera los arrays de muestras salvo que se pidan (`includeSamples`) y limita cada respuesta a unos 100.000 caracteres.
-- **Unidades corregidas:** Garmin manda el peso y la composición corporal en gramos aunque su referencia diga kilos; el servidor los devuelve en kilos.
-- **FIT decodificado:** `garmin_get_activity_fit` descarga el ZIP original y lo decodifica con el [SDK oficial de FIT](https://github.com/garmin/fit-javascript-sdk). Devuelve sesiones, vueltas, parciales por km calculados con todos los registros, splits de Garmin, zonas y, si se pide, la serie temporal en formato tabla.
-- **Errores accionables:** los fallos de Garmin (key caducada, rango no válido, 429…) llegan al modelo como errores de la tool con instrucciones para corregirlos.
-- **"Hoy" en tu zona horaria:** usa `TIMEZONE`. Las instrucciones del servidor incluyen la fecha y el día de la semana.
+- **Long ranges:** date ranges are split into the windows each endpoint allows (28 days for steps and stress, 31 for sleep or Body Battery, 1 year for daily summaries) and the results are merged.
+- **Compact views:** activity search and the daily and sleep histories return one row of key metrics by default; `detail=full` returns Garmin's complete response.
+- **Aggregation:**
+  - Daily, sleep and weigh-in histories average by week or month (`period`).
+  - Activity search totals by period and sport (`groupBy`), merging subtypes: street, trail and treadmill running all count as running.
+- **Clean output:**
+  - Nulls and social noise are dropped.
+  - Epoch timestamps become ISO 8601 and decimals are rounded.
+  - Sample arrays are left out unless requested (`includeSamples`), and each result is capped at about 100,000 characters.
+- **Fixed units:** Garmin sends weight and body composition in grams although its reference says kilograms; the server returns kilograms.
+- **Decoded FIT files:** `garmin_get_activity_fit` downloads the original ZIP and decodes it with Garmin's [official FIT SDK](https://github.com/garmin/fit-javascript-sdk). It returns sessions, laps, per-kilometre splits computed from every record, Garmin's own splits, time in zones and, on request, the timeline as a table.
+- **Actionable errors:** Garmin failures (expired key, invalid range, 429…) reach the model as tool errors that say how to fix them.
+- **"Today" in your time zone:** set by `TIMEZONE`. The server instructions include today's date and weekday.
 
-## Tools y prompts
+## Tools and prompts
 
-Hay una tool por cada uno de los 26 endpoints de la Personal API, con todos sus parámetros documentados. Todas son de solo lectura (`readOnlyHint`).
+There is one tool per Personal API endpoint (26), with every documented parameter. All of them are read-only (`readOnlyHint`).
 
-| Tool | Qué devuelve | Endpoint de Garmin |
+| Tool | Returns | Garmin endpoint |
 |---|---|---|
-| **Día** | | |
-| `garmin_get_daily_summary` | Todo un día: pasos, calorías, pisos, minutos de intensidad, FC, estrés, Body Battery, SpO2, respiración, hidratación | `usersummary/daily` |
-| `garmin_get_daily_summaries` | Resumen por día de un rango, o medias por semana o mes | `v2/dailysummaries` |
-| `garmin_get_steps` | Pasos, distancia y objetivo por día | `stats/steps/daily` |
-| `garmin_get_stress` | Estrés diario (0-100) | `stats/stress/daily` |
-| `garmin_get_hydration` | Agua registrada, objetivo y sudoración estimada | `stats/hydration/daily` |
-| `garmin_get_heart_rate` | FC de un día: reposo, mín./máx., media de 7 días y, opcionalmente, la serie completa | `wellness/dailyHeartRate` |
-| `garmin_get_spo2` | Pulsioximetría de un día y medias por hora | `wellness/daily/spo2acclimation` |
-| `garmin_get_body_battery` | Body Battery por día, con `chunks` para mínimo y máximo por intervalo (p. ej. por horas) | `wellness/bodyBattery/reports/daily` |
-| **Sueño y HRV** | | |
-| `garmin_get_sleep` | Una noche: fases, puntuación, necesidad de sueño, FC, estrés, SpO2 | `sleep/dailySleep` |
-| `garmin_get_sleep_history` | Noches de un rango, o medias por semana o mes | `sleep/dailySleepSummariesByDate` |
-| `garmin_get_hrv` | HRV nocturna: media, línea base y estado | `hrv-service/hrv/{fecha}` |
-| `garmin_get_hrv_history` | HRV por día de un rango | `hrv-service/hrv/daily` |
-| **Actividades** | | |
-| `garmin_search_activities` | Búsqueda con todos los filtros de Garmin; con `groupBy`, totales por semana, mes o rango y deporte | `activitylist-service/activities/search` |
-| `garmin_get_activity` | Resumen completo de una actividad y sus splits | `activity-service/activity/{id}` |
-| `garmin_get_activity_workouts` | Entreno estructurado realizado en la actividad | `activity-service/activity/{id}/workouts` |
-| `garmin_get_activity_fit` | El FIT decodificado: sesiones, vueltas, parciales por km, zonas y serie temporal | `download-service/files/activity/{id}` |
-| `garmin_get_wellness_activities` | Actividades de bienestar de un rango | `wellnessactivity-service/activity/summary/range` |
-| **Cuerpo** | | |
-| `garmin_get_weight` | Resumen de peso por día, media del rango y pesajes vecinos | `weight-service/weight/range` |
-| `garmin_get_weigh_ins` | Cada pesaje con composición corporal, o medias por semana o mes con mínimo y máximo | `weight-service/weight/all` |
-| `garmin_get_weight_goals` | Objetivos de peso | `goal-service/goal/user/effective/weightgoal` |
-| `garmin_get_fitness_age` | Edad fitness y sus componentes | `fitnessage-service/fitnessage/v2` |
-| `garmin_get_heart_rate_zones` | Zonas de FC configuradas por deporte | `biometric-service/heartRateZones/v2` |
-| **Otros** | | |
-| `garmin_get_nutrition` | Comidas registradas, objetivos y totales | `nutrition-service/food/logs` |
-| `garmin_get_menstrual_cycle` | Resumen del ciclo menstrual | `periodichealth-service/menstrualcycle/summary` |
-| `garmin_get_menstrual_cycle_day` | Detalle del ciclo de un día | `periodichealth-service/menstrualcycle/dayview` |
-| `garmin_get_profile_settings` | Unidades, zona horaria y preferencias del perfil | `userprofile-service/userprofile/settings` |
+| **Daily** | | |
+| `garmin_get_daily_summary` | One whole day: steps, calories, floors, intensity minutes, heart rate, stress, Body Battery, SpO2, respiration, hydration | `usersummary/daily` |
+| `garmin_get_daily_summaries` | A summary per day for a range, or weekly or monthly averages | `v2/dailysummaries` |
+| `garmin_get_steps` | Steps, distance and goal per day | `stats/steps/daily` |
+| `garmin_get_stress` | Daily stress (0-100) | `stats/stress/daily` |
+| `garmin_get_hydration` | Logged water, goal and estimated sweat loss | `stats/hydration/daily` |
+| `garmin_get_heart_rate` | One day's heart rate: resting, min/max, 7-day average and, optionally, the full timeline | `wellness/dailyHeartRate` |
+| `garmin_get_spo2` | One day's pulse oximetry and hourly averages | `wellness/daily/spo2acclimation` |
+| `garmin_get_body_battery` | Body Battery per day, with `chunks` for min and max per interval (e.g. hourly) | `wellness/bodyBattery/reports/daily` |
+| **Sleep and HRV** | | |
+| `garmin_get_sleep` | One night: stages, score, sleep need, heart rate, stress, SpO2 | `sleep/dailySleep` |
+| `garmin_get_sleep_history` | The nights in a range, or weekly or monthly averages | `sleep/dailySleepSummariesByDate` |
+| `garmin_get_hrv` | Overnight HRV: average, baseline and status | `hrv-service/hrv/{date}` |
+| `garmin_get_hrv_history` | HRV per day for a range | `hrv-service/hrv/daily` |
+| **Activities** | | |
+| `garmin_search_activities` | Search with every Garmin filter; with `groupBy`, totals per week, month or range and sport | `activitylist-service/activities/search` |
+| `garmin_get_activity` | Full summary of one activity and its splits | `activity-service/activity/{id}` |
+| `garmin_get_activity_workouts` | Structured workout performed during the activity | `activity-service/activity/{id}/workouts` |
+| `garmin_get_activity_fit` | The decoded FIT file: sessions, laps, per-km splits, zones and timeline | `download-service/files/activity/{id}` |
+| `garmin_get_wellness_activities` | Wellness activities in a range | `wellnessactivity-service/activity/summary/range` |
+| **Body** | | |
+| `garmin_get_weight` | Weight summary per day, range average and neighbouring weigh-ins | `weight-service/weight/range` |
+| `garmin_get_weigh_ins` | Every weigh-in with body composition, or weekly or monthly averages with min and max | `weight-service/weight/all` |
+| `garmin_get_weight_goals` | Weight goals | `goal-service/goal/user/effective/weightgoal` |
+| `garmin_get_fitness_age` | Fitness age and its components | `fitnessage-service/fitnessage/v2` |
+| `garmin_get_heart_rate_zones` | Heart rate zones configured per sport | `biometric-service/heartRateZones/v2` |
+| **Other** | | |
+| `garmin_get_nutrition` | Logged meals, goals and totals | `nutrition-service/food/logs` |
+| `garmin_get_menstrual_cycle` | Menstrual cycle summary | `periodichealth-service/menstrualcycle/summary` |
+| `garmin_get_menstrual_cycle_day` | Menstrual cycle detail for one day | `periodichealth-service/menstrualcycle/dayview` |
+| `garmin_get_profile_settings` | Units, time zone and profile preferences | `userprofile-service/userprofile/settings` |
 
-Prompts (atajos que el cliente muestra como comandos):
+Prompts (shortcuts that clients show as commands):
 
-- `readiness_check`: ¿cómo estoy hoy para entrenar? Cruza sueño, HRV, Body Battery, FC en reposo, estrés y la carga reciente.
-- `training_review`: revisión de las últimas semanas de entreno (volumen, intensidad, recuperación).
+- `readiness_check`: how ready am I to train today? Combines sleep, HRV, Body Battery, resting heart rate, stress and recent load.
+- `training_review`: a review of recent weeks of training (volume, intensity, recovery).
 
-## Estructura del repositorio
+## Repository layout
 
 ```
 src/
-  index.ts              Punto de entrada: OAuthProvider protege /mcp y sirve /authorize
-  env.d.ts              Tipos de bindings que añade OAuthProvider en tiempo de ejecución
-  auth/authorize.ts     Página de consentimiento: contraseña del propietario y límite de intentos
+  index.ts              Entry point: OAuthProvider protects /mcp and serves /authorize
+  env.d.ts              Types for the bindings OAuthProvider adds at runtime
+  auth/authorize.ts     Consent page: owner password and attempt limit
   garmin/
-    client.ts           Cliente de la Personal API: canje de key, caché del token, errores
-    dates.ts            Fechas: "hoy" por zona horaria, ventanas de rangos
-    fit.ts              Descompresión y decodificación de FIT, parciales por distancia
+    client.ts           Personal API client: key exchange, token cache, errors
+    dates.ts            Dates: "today" per time zone, range windows
+    fit.ts              FIT unzipping and decoding, distance splits
   mcp/
-    server.ts           Servidor MCP: instrucciones, registro de tools y prompts
-    context.ts          Esquemas comunes (fechas, rangos) y troceo de rangos
-    result.ts           Formato de respuestas: limpieza, timestamps, límite de tamaño, errores
-    summaries.ts        Vistas compactas y agregaciones (period, groupBy)
-    tools/              Tools por área: daily, sleep, activities, body, profile
-test/                   Tests con Vitest dentro de workerd (Garmin simulado)
-evals/                  Prompts sintéticos y runner para probar con Claude real
-.github/workflows/      CI: typecheck y tests en cada push y PR
-wrangler.jsonc          Configuración del Worker: bindings, variables, secretos requeridos
-worker-configuration.d.ts  Tipos generados con `pnpm cf-typegen`
+    server.ts           MCP server: instructions, tool and prompt registration
+    context.ts          Shared schemas (dates, ranges) and range splitting
+    result.ts           Response formatting: cleanup, timestamps, size cap, errors
+    summaries.ts        Compact views and aggregations (period, groupBy)
+    tools/              Tools by area: daily, sleep, activities, body, profile
+test/                   Vitest suite running inside workerd (Garmin mocked)
+evals/                  Synthetic prompts and a runner to test with real Claude
+.github/workflows/      CI: typecheck and tests on every push and PR
+wrangler.jsonc          Worker configuration: bindings, variables, required secrets
+worker-configuration.d.ts  Types generated with `pnpm cf-typegen`
 ```
 
-## Configuración
+## Configuration
 
-### Secretos
+### Secrets
 
-Están en `.env` en local y como secretos del Worker en producción. Nunca van a git.
+They live in `.env` locally and as Worker secrets in production. They never go to git.
 
-| Nombre | Qué es | Dónde obtenerlo |
+| Name | What it is | Where to get it |
 |---|---|---|
-| `GARMIN_API_KEY` | Personal API key de tu cuenta de Garmin Connect. El servidor la canjea por tokens de 24 h. | En [Garmin Connect → Personal API](https://connect.garmin.com/app/settings/personalApiToken), con sesión iniciada en la web: *Create Key*, aceptar los términos y elegir la caducidad (30, 90, 180 días o 1 año). Se muestra **una sola vez**. Solo puede haber una key activa: crear otra exige borrar la anterior. |
-| `OWNER_PASSWORD` | Contraseña de la página de consentimiento. Es lo que impide que otra persona conecte un cliente a tu servidor. | Invéntala, larga y aleatoria: `openssl rand -base64 32`. Guárdala en tu gestor de contraseñas: la pedirá cada vez que conectes un cliente nuevo. |
+| `GARMIN_API_KEY` | The Personal API key of your Garmin Connect account. The server exchanges it for 24-hour tokens. | In [Garmin Connect → Personal API](https://connect.garmin.com/app/settings/personalApiToken), signed in on the web: *Create Key*, accept the terms and pick an expiry (30, 90, 180 days or 1 year). It is shown **only once**. Only one key can be active: creating another requires deleting the current one. |
+| `OWNER_PASSWORD` | The consent page password. It stops anyone else from connecting a client to your server. | Make up a long random one: `openssl rand -base64 32`. Keep it in your password manager: you'll need it every time you connect a new client. |
 
 ### Variables
 
-Están definidas en `wrangler.jsonc`, en `vars`. No son secretas.
+Set in `wrangler.jsonc`, under `vars`. They are not secret.
 
-| Nombre | Valor | Para qué |
+| Name | Value | Purpose |
 |---|---|---|
-| `GARMIN_REGION` | `global` | `global` usa `personal.connectapi.garmin.com`; `cn` usa la de Garmin Connect China. |
-| `TIMEZONE` | `Europe/Madrid` | Zona horaria IANA para resolver "hoy" cuando una tool no recibe fecha. |
+| `GARMIN_REGION` | `global` | `global` uses `personal.connectapi.garmin.com`; `cn` uses the Garmin Connect China endpoint. |
+| `TIMEZONE` | `Europe/Madrid` | IANA time zone used to resolve "today" when a tool gets no date. |
 
 ### Bindings
 
-| Binding | Tipo | Para qué |
+| Binding | Type | Purpose |
 |---|---|---|
-| `OAUTH_KV` | KV namespace (`garmin-mcp-oauth-kv`) | Estado de OAuth: clientes registrados, permisos concedidos y tokens (guardados solo como hash, con los datos asociados cifrados). También cachea el token de Garmin para que todas las instancias del Worker lo compartan. |
-| `LOGIN_LIMITER` | Rate limiting | Máximo de 5 intentos de contraseña por minuto e IP en la página de consentimiento. |
+| `OAUTH_KV` | KV namespace (`garmin-mcp-oauth-kv`) | OAuth state: registered clients, granted consents and tokens (stored only as hashes, with their data encrypted). It also caches the Garmin token so every Worker instance shares it. |
+| `LOGIN_LIMITER` | Rate limiting | At most 5 password attempts per minute and IP on the consent page. |
 
-### Ficheros de entorno
+### Environment files
 
-| Fichero | En git | Contenido |
+| File | In git | Contents |
 |---|---|---|
-| `.env.example` | sí | Plantilla con las claves documentadas y vacías |
-| `.env` | no | Tus secretos locales. `wrangler dev` los carga y el despliegue puede subirlos (`--secrets-file .env`). |
+| `.env.example` | yes | Template with the keys documented and empty |
+| `.env` | no | Your local secrets. `wrangler dev` loads them and a deploy can upload them (`--secrets-file .env`). |
 
-## Desarrollo local
+## Local development
 
-Necesitas Node 26 (`fnm use`, lee `.node-version`) y pnpm, en la versión que fija `packageManager`.
+You need Node 26 (`fnm use` reads `.node-version`) and pnpm, at the version pinned by `packageManager`.
 
 ```bash
 pnpm install
@@ -165,160 +166,164 @@ pnpm install
 cp .env.example .env
 ```
 
-Rellena `GARMIN_API_KEY` y `OWNER_PASSWORD` en `.env` y arranca el servidor. Queda en `http://localhost:8787/mcp`:
+Fill in `GARMIN_API_KEY` and `OWNER_PASSWORD` in `.env` and start the server. It runs at `http://localhost:8787/mcp`:
 
 ```bash
 pnpm dev
 ```
 
-Para probarlo a mano tienes dos opciones:
+To try it by hand you have two options:
 
-- **MCP Inspector:** arráncalo y conecta a `http://localhost:8787/mcp`. Te llevará a la página de consentimiento.
+- **MCP Inspector:** start it and connect to `http://localhost:8787/mcp`. It takes you to the consent page.
 
   ```bash
   pnpm dlx @modelcontextprotocol/inspector
   ```
 
-- **Claude Code**, en la misma máquina:
+- **Claude Code**, on the same machine:
 
   ```bash
   claude mcp add --transport http garmin-local http://localhost:8787/mcp
   ```
 
-En local, el KV y el rate limiter son simulados y se guardan en `.wrangler/state`.
+Locally, KV and the rate limiter are simulated and stored in `.wrangler/state`.
 
 Scripts:
 
-| Script | Qué hace |
+| Script | What it does |
 |---|---|
-| `pnpm dev` | Servidor local con recarga en caliente |
-| `pnpm check` | Typecheck y tests |
-| `pnpm typecheck` | TypeScript de `src/` y `test/` |
-| `pnpm test` | Tests con Vitest dentro de workerd |
-| `pnpm run deploy` | Despliega a Cloudflare (`pnpm deploy` a secas es otro comando de pnpm) |
-| `pnpm cf-typegen` | Regenera `worker-configuration.d.ts` tras cambiar `wrangler.jsonc` |
-| `pnpm evals` | Lanza los prompts sintéticos contra un servidor en marcha |
+| `pnpm dev` | Local server with hot reload |
+| `pnpm check` | Typecheck and tests |
+| `pnpm typecheck` | TypeScript for `src/` and `test/` |
+| `pnpm test` | Vitest suite inside workerd |
+| `pnpm run deploy` | Deploy to Cloudflare (plain `pnpm deploy` is a different pnpm command) |
+| `pnpm cf-typegen` | Regenerate `worker-configuration.d.ts` after changing `wrangler.jsonc` |
+| `pnpm evals` | Run the synthetic prompts against a running server |
 
-## Tests, CI y evals
+## Tests, CI and evals
 
-- **Tests (`test/`):** corren dentro del runtime de Workers con `@cloudflare/vitest-plugin`, simulando las respuestas de Garmin. Cubren:
-  - el cliente de Garmin: canje y caché del token, reintento en 401 y errores;
-  - el flujo OAuth completo;
-  - el troceo de rangos y los filtros de búsqueda;
-  - las vistas compactas, las agregaciones y la conversión a kilos;
-  - un FIT real generado con el encoder del SDK.
-- **CI:** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) ejecuta `pnpm typecheck` y `pnpm test` en cada push a `main` y en cada pull request. No despliega.
-- **Evals:** `evals/prompts.json` tiene 25 preguntas realistas: sueño, recuperación, tendencias, entrenos, totales y casos sin datos o fuera de alcance. `evals/run.mjs` las lanza con Claude Code en modo headless contra un servidor en marcha, sin más tools que este MCP. Registra qué tools elige el modelo, los errores, los tamaños y la respuesta. Necesita el CLI de Claude con sesión iniciada. Los resultados contienen tus datos y van a `evals/results/`, fuera de git.
+- **Tests (`test/`)** run inside the Workers runtime with `@cloudflare/vitest-plugin`, mocking Garmin's responses. They cover:
+  - the Garmin client: key exchange, token cache, retry on 401 and errors;
+  - the full OAuth flow;
+  - range splitting and search filters;
+  - compact views, aggregations and the kilogram conversion;
+  - a real FIT file generated with the SDK's encoder.
+- **CI:** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `pnpm typecheck` and `pnpm test` on every push to `main` and every pull request. It does not deploy.
+- **Evals:** `evals/prompts.json` holds 25 realistic questions: sleep, recovery, trends, training, totals, and cases with no data or out of scope. They are in Spanish on purpose, plus one in English, to test a non-English user. `evals/run.mjs` runs them through Claude Code in headless mode against a running server, with no tools other than this MCP. It records which tools the model chose, errors, sizes and the answer. It needs the Claude CLI signed in. Results contain your data and go to `evals/results/`, which is git-ignored.
 
   ```bash
   pnpm evals --base http://localhost:8787 --model sonnet
   ```
 
-## Despliegue
+## Deployment
 
-### Qué se despliega
+### What gets deployed
 
 | | |
 |---|---|
-| Worker | `garmin-mcp`, en tu cuenta de Cloudflare |
-| URL del MCP | `https://garmin-mcp.<tu-subdominio>.workers.dev/mcp` (el subdominio `workers.dev` es el de tu cuenta) |
-| Raíz (`/`) | JSON con el nombre, la versión y la URL del MCP, útil como comprobación |
-| KV | `garmin-mcp-oauth-kv`, creado por el primer despliegue y reutilizado por los siguientes |
-| Secretos | `GARMIN_API_KEY`, `OWNER_PASSWORD` (tipo `secret_text`) |
-| Observabilidad | Logs de Workers activados (dashboard → Workers & Pages → garmin-mcp → Logs) |
-| Preview URLs | Desactivadas: el único origen OAuth es el de producción |
-| Cómo se despliega | A mano desde local con `pnpm run deploy`. La CI solo verifica. |
+| Worker | `garmin-mcp`, in your Cloudflare account |
+| MCP URL | `https://garmin-mcp.<your-subdomain>.workers.dev/mcp` (the `workers.dev` subdomain of your account) |
+| Root (`/`) | JSON with the name, version and MCP URL, handy as a health check |
+| KV | `garmin-mcp-oauth-kv`, created by the first deploy and reused by later ones |
+| Secrets | `GARMIN_API_KEY`, `OWNER_PASSWORD` (type `secret_text`) |
+| Observability | Workers logs on (dashboard → Workers & Pages → garmin-mcp → Logs) |
+| Preview URLs | Off: the production origin is the only OAuth issuer |
+| How it's deployed | By hand from your machine with `pnpm run deploy`. CI only checks. |
 
-### Primer despliegue
+### First deploy
 
-1. Inicia sesión en wrangler (si se queda esperando, mira [Solución de problemas](#solución-de-problemas)):
+1. Sign in to wrangler (if it hangs, see [Troubleshooting](#troubleshooting)):
 
    ```bash
    pnpm wrangler login
    ```
 
-2. Prepara `.env` con los dos secretos y despliega subiéndolos a la vez:
+2. Fill in `.env` with both secrets and deploy, uploading them at the same time:
 
    ```bash
    pnpm wrangler deploy --secrets-file .env
    ```
 
-3. Wrangler muestra la URL del Worker: añade `/mcp` y [conecta un cliente](#conectar-un-cliente).
+3. Wrangler prints the Worker URL: add `/mcp` and [connect a client](#connecting-a-client).
 
-### Desplegar cambios
+### Deploying changes
 
-Verifica y despliega. Los secretos y el KV se conservan entre despliegues:
+Check and deploy. Secrets and KV are kept between deploys:
 
 ```bash
 pnpm check && pnpm run deploy
 ```
 
-## Conectar un cliente
+## Connecting a client
 
-- **Claude (web, escritorio, móvil):** Ajustes → Conectores → Añadir conector personalizado, con la URL del MCP.
+- **Claude (web, desktop, mobile):** Settings → Connectors → Add custom connector, with the MCP URL.
 - **Claude Code:**
 
   ```bash
-  claude mcp add --transport http garmin https://garmin-mcp.<tu-subdominio>.workers.dev/mcp
+  claude mcp add --transport http garmin https://garmin-mcp.<your-subdomain>.workers.dev/mcp
   ```
 
-  Después autentícalo desde `/mcp`.
-- **Otros clientes (Cursor, VS Code…):** cualquier cliente MCP con OAuth y transporte Streamable HTTP. Añádelo con la misma URL.
+  Then authenticate it from `/mcp`.
+- **Other clients (Cursor, VS Code…):** any MCP client with OAuth and Streamable HTTP transport. Add it with the same URL.
 
-El cliente abre la página de consentimiento: revisa el nombre y el destino que muestra, introduce `OWNER_PASSWORD` y pulsa *Permitir*.
+The client opens the consent page: check the name and destination it shows, enter `OWNER_PASSWORD` and click *Allow*.
 
-## Operación
+## Operations
 
-- **La key de Garmin caduca:** Garmin envía un email una semana antes. Crea una key nueva (borrando la anterior) y actualiza el secreto. El token de Garmin cacheado deja de valer solo, porque la caché está ligada a la key.
+- **The Garmin key expires:** Garmin emails you a week before. Create a new key (deleting the old one) and update the secret. The cached Garmin token stops being used on its own, because the cache is tied to the key.
 
   ```bash
   pnpm wrangler secret put GARMIN_API_KEY
   ```
 
-- **Cambiar la contraseña de consentimiento.** Los clientes ya conectados siguen funcionando hasta que caduquen sus tokens.
+- **Change the consent password.** Clients already connected keep working until their tokens expire.
 
   ```bash
   pnpm wrangler secret put OWNER_PASSWORD
   ```
 
-- **Ver logs en directo:**
+- **Live logs:**
 
   ```bash
   pnpm wrangler tail garmin-mcp
   ```
 
-- **Desconectar todos los clientes:** borra el contenido del namespace `garmin-mcp-oauth-kv` desde el dashboard. Tendrán que volver a autorizarse.
+- **Disconnect every client:** clear the `garmin-mcp-oauth-kv` namespace from the dashboard. Clients will have to authorize again.
 
-## Seguridad
+## Security
 
-- **Acceso a `/mcp`:** solo con un token OAuth emitido por este servidor para su propia URL y con el scope `garmin:read`.
-- **Página de consentimiento:**
-  - Muestra el nombre de la aplicación, si está verificada y el host al que se enviará el token, y avisa cuando el destino es una app local.
-  - El formulario lleva un identificador de un solo uso ligado al navegador y no se puede incrustar en otra web.
-  - La contraseña se compara en tiempo constante y hay un límite de 5 intentos por minuto e IP.
-- **Secretos:** la key de Garmin solo vive en los secretos del Worker. Los clientes MCP nunca la ven y no aparece en logs ni en respuestas.
-- **Solo lectura:** la Personal API no permite escribir y el servidor solo hace `GET`.
-- **Uso personal:** la Personal API es para el titular de la key. Este servidor está pensado para un único usuario y no debe compartirse con terceros.
+- **Access to `/mcp`:** only with an OAuth token issued by this server for its own URL, with the `garmin:read` scope.
+- **Consent page:**
+  - It shows the application's name, whether it is verified and the host the token will be sent to, and warns when the destination is a local app.
+  - The form carries a single-use handle bound to the browser and cannot be embedded in another site.
+  - The password is compared in constant time, with a limit of 5 attempts per minute and IP.
+- **Secrets:** the Garmin key only lives in the Worker's secrets. MCP clients never see it, and it never appears in logs or responses.
+- **Read-only:** the Personal API cannot write, and the server only sends `GET` requests.
+- **Personal use:** the Personal API is for the key's owner. This server is meant for a single user and should not be shared with others.
 
-## Límites
+## Limits
 
-- **Lo que no da la Personal API:** Training Readiness, VO2 max, predicciones de carrera, dispositivos, equipo, rutas, ni subir entrenos. Es de solo lectura y bajo demanda, sin webhooks.
-- **Rate limits:** Garmin no publica límites. El servidor hace en serie las peticiones de un rango, y `groupBy` revisa como máximo 1.000 actividades (10 peticiones).
-- **CPU:** decodificar un FIT largo consume más de los 10 ms de CPU por petición del plan gratuito de Workers. En producción el FIT más pesado probado usó 157 ms y funcionó.
-- **Coste:** el uso de KV y de Workers de un único usuario entra de sobra en el plan gratuito de Cloudflare.
+- **What the Personal API doesn't offer:** Training Readiness, VO2 max, race predictions, devices, gear, courses, or uploading workouts. It is read-only and on demand, with no webhooks.
+- **Rate limits:** Garmin publishes none. The server makes the requests for a range one after another, and `groupBy` scans at most 1,000 activities (10 requests).
+- **CPU:** decoding a long FIT file takes more than the 10 ms of CPU per request of the Workers Free plan. The heaviest FIT file tested in production used 157 ms and worked.
+- **Cost:** a single user's KV and Workers usage fits comfortably in Cloudflare's free tier.
 
-## Solución de problemas
+## Troubleshooting
 
-- **`wrangler login` se queda esperando y caduca:** usa el flujo con código. No necesita que el navegador vuelva a `localhost`, y aquí pide solo los permisos necesarios:
+- **`wrangler login` waits and times out:** use the device code flow. It doesn't need the browser to call back to `localhost`, and here it only asks for the permissions this project needs:
 
   ```bash
   pnpm wrangler login --device --scopes account:read user:read workers:write workers_kv:write workers_scripts:write workers_tail:read
   ```
 
-- **Las tools responden "Garmin rejected the Personal API key":** la key ha caducado o la has borrado. Crea otra y actualiza `GARMIN_API_KEY`.
-- **El cliente no puede conectar o pide autorizar otra vez:** su token de refresco caducó (más de un mes sin uso) o se borró el KV. Vuelve a autorizarlo desde el cliente.
-- **Dos `wrangler dev` a la vez fallan con `SQLITE_BUSY`:** comparten `.wrangler/state`. Arranca el segundo con su propio estado:
+- **Tools answer "Garmin rejected the Personal API key":** the key expired or was deleted. Create another and update `GARMIN_API_KEY`.
+- **A client can't connect or asks to authorize again:** its refresh token expired (over a month without use) or the KV was cleared. Authorize it again from the client.
+- **Two `wrangler dev` at once fail with `SQLITE_BUSY`:** they share `.wrangler/state`. Start the second one with its own state:
 
   ```bash
   pnpm dev --port 8788 --persist-to /tmp/garmin-mcp-state
   ```
+
+## License
+
+[MIT](LICENSE) © Iván Barcia

@@ -271,7 +271,7 @@ pnpm check && pnpm run deploy
 
 ## Connecting a client
 
-- **Claude (web, desktop, mobile):** Settings → Connectors → Add custom connector, with the MCP URL.
+- **Claude (web, desktop, mobile):** on [claude.ai](https://claude.ai), Settings → Connectors → Add custom connector, with the MCP URL. A connector added there is also available in the desktop and mobile apps.
 - **Claude Code:**
 
   ```bash
@@ -281,7 +281,7 @@ pnpm check && pnpm run deploy
   Then authenticate it from `/mcp`.
 - **Other clients (Cursor, VS Code…):** any MCP client with OAuth and Streamable HTTP transport. Add it with the same URL.
 
-The client opens `/authorize` in your browser: sign in with the code Access emails you, check the application name and destination on the consent page, and click *Allow*.
+The client opens `/authorize` in your browser: sign in with the code Access emails you, check the application name and destination on the consent page, and click *Allow*. This flow has been tested end to end with Claude on the web.
 
 ## Operations
 

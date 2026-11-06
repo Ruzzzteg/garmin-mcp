@@ -19,7 +19,7 @@
     // "global" (connect.garmin.com) or "cn" (connect.garmin.cn)
     "GARMIN_REGION": "global",
     // IANA time zone used to resolve "today" when a date is omitted
-    "TIMEZONE": "Europe/Madrid"
+    "TIMEZONE": "Asia/Almaty"
   },
   // ACCESS_AUD: audience tag of the Cloudflare Access application that
   // protects /authorize.

@@ -14,7 +14,12 @@
   // OAuth clients, grants and tokens, plus the cached Garmin bearer token.
   // Without an id, the first `wrangler deploy` provisions the namespace
   // ("garmin-mcp-oauth-kv") and later deploys keep using it.
-  "kv_namespaces": [{ "binding": "OAUTH_KV" }],
+  "kv_namespaces": [
+  {
+    "binding": "OAUTH_KV",
+    "id": "8dbbdf378f7425f938265491c6564d00"
+  }
+],
   "vars": {
     // "global" (connect.garmin.com) or "cn" (connect.garmin.cn)
     "GARMIN_REGION": "global",
